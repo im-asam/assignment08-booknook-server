@@ -11,18 +11,24 @@ const { getDb } = require("../db");
 // As a fallback, HS256 tokens signed with the shared BETTER_AUTH_SECRET
 // are also accepted, so either client configuration keeps working.
 
-const CLIENT_BASE = (
-  process.env.CLIENT_URL || "https://assignment08-booknook-client.vercel.app"
-).replace(/\/$/, "");
-
-const JWKS_URL = `${CLIENT_BASE}/api/auth/jwks`;
+// The client app's origin is fixed; derive the JWKS URL from it directly
+// instead of the server's CLIENT_URL env var (which exists for CORS).
+const JWKS_URL =
+  "https://assignment08-booknook-client.vercel.app/api/auth/jwks";
 const JWKS_TTL_MS = 10 * 60 * 1000;
 
 let jwksCache = null; // { keys: [...], fetchedAt: number }
 
 async function fetchJwks() {
-  const res = await fetch(JWKS_URL, { signal: AbortSignal.timeout(8000) });
+  let res;
+  try {
+    res = await fetch(JWKS_URL, { signal: AbortSignal.timeout(8000) });
+  } catch (err) {
+    console.error("JWKS fetch error:", err.message);
+    throw new Error(`JWKS fetch failed: ${err.message}`);
+  }
   if (!res.ok) {
+    console.error(`JWKS fetch HTTP ${res.status}`);
     throw new Error(`JWKS fetch failed (${res.status})`);
   }
   const data = await res.json();
@@ -39,6 +45,43 @@ async function getJwksKeys(forceRefresh = false) {
   return jwksCache.keys;
 }
 
+// Verifies an EdDSA (Ed25519) JWT signature with Node's built-in crypto.
+// NOTE: jsonwebtoken 9.x cannot verify EdDSA tokens at all — its key
+// validator has no 'ed25519' entry and throws `Unknown key type "ed25519"`
+// for both KeyObject and PEM keys. So EdDSA verification is done here
+// directly (signature + exp/nbf checks); jsonwebtoken is only used for
+// the HS256 fallback below.
+function verifyEdDSA(token, publicKey) {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error("Invalid JWT format");
+  }
+  const [headerB64, payloadB64, signatureB64] = parts;
+  const data = Buffer.from(`${headerB64}.${payloadB64}`, "utf8");
+  const signature = Buffer.from(signatureB64, "base64url");
+  let valid;
+  try {
+    valid = crypto.verify(null, data, publicKey, signature);
+  } catch (err) {
+    console.error("EdDSA verify failed:", err.message);
+    throw new Error(`EdDSA verify failed: ${err.message}`);
+  }
+  if (!valid) {
+    throw new Error("Invalid signature");
+  }
+  const payload = JSON.parse(
+    Buffer.from(payloadB64, "base64url").toString("utf8"),
+  );
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp && now >= payload.exp) {
+    throw new Error("Token expired");
+  }
+  if (payload.nbf && now < payload.nbf) {
+    throw new Error("Token not yet valid");
+  }
+  return payload;
+}
+
 function verifyWithJwks(token, kid) {
   return getJwksKeys()
     .then(async (keys) => {
@@ -48,10 +91,11 @@ function verifyWithJwks(token, kid) {
         jwk = (await getJwksKeys(true)).find((k) => k.kid === kid);
       }
       if (!jwk) {
+        console.error(`JWKS has no key for kid ${kid}`);
         throw new Error("No matching key in JWKS");
       }
       const publicKey = crypto.createPublicKey({ key: jwk, format: "jwk" });
-      return jwt.verify(token, publicKey, { algorithms: ["EdDSA"] });
+      return verifyEdDSA(token, publicKey);
     });
 }
 
@@ -97,7 +141,10 @@ async function verifyToken(req, res, next) {
   try {
     decoded = await verifyJwt(token);
   } catch (err) {
-    return res.status(401).json({ error: "Unauthorized" });
+    console.error("JWT verify failed:", err.message);
+    // TEMPORARY diagnostic: expose the failure reason while debugging the
+    // production 401s. Remove `detail` once verification is confirmed live.
+    return res.status(401).json({ error: "Unauthorized", detail: err.message });
   }
 
   req.userId = decoded.sub || null;
