@@ -142,9 +142,7 @@ async function verifyToken(req, res, next) {
     decoded = await verifyJwt(token);
   } catch (err) {
     console.error("JWT verify failed:", err.message);
-    // TEMPORARY diagnostic: expose the failure reason while debugging the
-    // production 401s. Remove `detail` once verification is confirmed live.
-    return res.status(401).json({ error: "Unauthorized", detail: err.message });
+    return res.status(401).json({ error: "Unauthorized" });
   }
 
   req.userId = decoded.sub || null;
