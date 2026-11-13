@@ -170,6 +170,117 @@ app.delete("/books/:id", verifyToken, async (req, res, next) => {
   }
 });
 
+// ---------- Borrows ----------
+
+// POST /borrows — protected. Borrows a book (one copy per user per book).
+app.post("/borrows", verifyToken, async (req, res, next) => {
+  try {
+    const { bookId, bookTitle, bookImage, userName, userEmail, borrowDate, returnDate } =
+      req.body || {};
+
+    // (a) userEmail must match the token's user.
+    if (userEmail !== req.userEmail) {
+      return res.status(403).json({ error: "Forbidden: userEmail does not match your account" });
+    }
+    if (!bookId || !bookTitle || !userName) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const db = await getDb();
+    const books = db.collection("books");
+    const borrows = db.collection("borrows");
+
+    // (b) book must exist.
+    if (!ObjectId.isValid(bookId)) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+    const book = await books.findOne({ _id: new ObjectId(bookId) });
+    if (!book) {
+      return res.status(404).json({ error: "Book not found" });
+    }
+
+    // (c) no double borrow of the same book by the same user.
+    const existing = await borrows.findOne({ bookId, userEmail });
+    if (existing) {
+      return res.status(409).json({ error: "You have already borrowed this book" });
+    }
+
+    // (d) copies must be available.
+    if (book.availableCopies <= 0) {
+      return res.status(400).json({ error: "This book is not available" });
+    }
+
+    const borrowStart = borrowDate ? new Date(borrowDate) : new Date();
+    const borrow = {
+      bookId,
+      bookTitle,
+      bookImage: bookImage || book.image || "",
+      userName,
+      userEmail,
+      borrowDate: borrowStart,
+      returnDate: returnDate
+        ? new Date(returnDate)
+        : new Date(borrowStart.getTime() + 14 * 24 * 60 * 60 * 1000),
+    };
+    const result = await borrows.insertOne(borrow);
+    await books.updateOne({ _id: book._id }, { $inc: { availableCopies: -1 } });
+    res.status(201).json({ _id: result.insertedId, ...borrow });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /borrows — protected. ?email=xxx must match the token's user.
+app.get("/borrows", verifyToken, async (req, res, next) => {
+  try {
+    if (req.query.email !== req.userEmail) {
+      return res.status(403).json({ error: "Forbidden: email does not match your account" });
+    }
+    const db = await getDb();
+    const borrows = await db
+      .collection("borrows")
+      .find({ userEmail: req.userEmail })
+      .sort({ borrowDate: -1 })
+      .toArray();
+    res.json(borrows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /borrows/:id — protected. Returns a book (restores one copy).
+app.delete("/borrows/:id", verifyToken, async (req, res, next) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid borrow id" });
+    }
+    const db = await getDb();
+    const borrows = db.collection("borrows");
+    const borrow = await borrows.findOne({ _id: new ObjectId(req.params.id) });
+    if (!borrow) {
+      return res.status(404).json({ error: "Borrow not found" });
+    }
+    if (borrow.userEmail !== req.userEmail) {
+      return res.status(403).json({ error: "Forbidden: this borrow is not yours" });
+    }
+    await borrows.deleteOne({ _id: borrow._id });
+    // Restore one copy, only if the book exists and is not already full.
+    if (ObjectId.isValid(borrow.bookId)) {
+      const book = await db
+        .collection("books")
+        .findOne({ _id: new ObjectId(borrow.bookId) });
+      if (book && book.availableCopies < book.totalCopies) {
+        await db
+          .collection("books")
+          .updateOne({ _id: book._id }, { $inc: { availableCopies: 1 } });
+      }
+    }
+    res.json({ deleted: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // 404 for unknown routes.
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
